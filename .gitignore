@@ -1,4 +1,19 @@
+# Variables de entorno (CRÍTICO)
 .env
-chroma/
+
+# Base de datos vectorial local
+chroma_db/
+
+# Caché de Python
 __pycache__/
+
+# Logs de la aplicación
 *.log
+
+# Archivos PDF subidos temporalmente
+uploaded_docs/chroma/
+context_cache_db/
+venv/
+cargar_croma.py
+chroma/
+uploaded_docs/

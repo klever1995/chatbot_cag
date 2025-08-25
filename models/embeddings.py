@@ -1,4 +1,3 @@
-# models/embeddings.py
 import logging
 from sentence_transformers import SentenceTransformer
 from config.settings import EMBEDDING_MODEL_NAME

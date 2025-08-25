@@ -1,4 +1,3 @@
-# cache/redis_manager.py
 import logging
 import json
 from datetime import datetime, timedelta
@@ -52,5 +51,5 @@ class MemoryCacheManager:
         except Exception as e:
             logger.error(f"❌ Error limpiando caché: {str(e)}")
 
-# Instancia singleton para ser importada (usando el mismo nombre para no romper imports)
+# Instancia singleton 
 redis_cache = MemoryCacheManager()

@@ -2,107 +2,150 @@
 import logging
 import hashlib
 from datetime import datetime, timedelta
+import chromadb
+from sentence_transformers import SentenceTransformer
 
 logger = logging.getLogger(__name__)
 
 class ContextCache:
-    """Caché de contexto para documentos estáticos (alternativa simple a vLLM)"""
+    """Caché de contexto semántica para documentos legales/laborales usando ChromaDB"""
     
     def __init__(self):
-        self.context_cache = {}  # Almacena documentos por su hash
-        self.access_times = {}   # Seguimiento de últimos accesos para LRU
-        logger.info("✅ Caché de contexto inicializada")
+        try:
+            # Inicializar ChromaDB para búsqueda semántica
+            self.client = chromadb.PersistentClient(path="./context_cache_db")
+            self.collection = self.client.get_or_create_collection(
+                name="legal_context_cache",
+                metadata={"hnsw:space": "cosine", "description": "Caché de contexto para documentos legales"}
+            )
+            
+            # Modelo de embeddings para búsqueda semántica
+            self.embedding_model = SentenceTransformer('all-MiniLM-L6-v2')
+            logger.info("✅ Caché de contexto semántica inicializada con ChromaDB")
+            
+        except Exception as e:
+            logger.error(f"❌ Error inicializando caché de contexto: {str(e)}")
+            raise
     
     def _generate_hash(self, content):
         """Genera un hash único para el contenido del documento"""
         return hashlib.md5(content.encode()).hexdigest()
     
-    def add_document(self, document_content, metadata=None):
-        """Añade un documento a la caché de contexto"""
+    def add_document(self, document_content, doc_type="legal", source="uploaded"):
+        """Añade un documento a la caché de contexto con embeddings semánticos"""
         try:
+            if not document_content or len(document_content.strip()) < 50:
+                logger.warning("⚠️ Contenido muy corto para añadir a caché")
+                return None
+            
             doc_hash = self._generate_hash(document_content)
             
-            self.context_cache[doc_hash] = {
-                "content": document_content,
-                "metadata": metadata or {},
-                "added_at": datetime.now()
+            # Generar embedding semántico
+            embedding = self.embedding_model.encode(document_content).tolist()
+            
+            metadata = {
+                "doc_type": doc_type,
+                "source": source,
+                "added_at": datetime.now().isoformat(),
+                "length": len(document_content),
+                "hash": doc_hash
             }
             
-            # Actualizar tiempo de acceso
-            self.access_times[doc_hash] = datetime.now()
+            # Añadir a ChromaDB con embedding
+            self.collection.add(
+                ids=[doc_hash],
+                documents=[document_content],
+                metadatas=[metadata],
+                embeddings=[embedding]
+            )
             
-            logger.debug(f"✅ Documento añadido a caché de contexto: {doc_hash[:8]}...")
+            logger.debug(f"✅ Documento añadido a caché semántica: {doc_hash[:8]}...")
             return doc_hash
             
         except Exception as e:
-            logger.error(f"❌ Error añadiendo documento a caché: {str(e)}")
+            logger.error(f"❌ Error añadiendo documento a caché semántica: {str(e)}")
             return None
     
-    def get_document(self, document_content):
-        """Recupera un documento de la caché si existe"""
-        try:
-            doc_hash = self._generate_hash(document_content)
-            
-            if doc_hash in self.context_cache:
-                # Actualizar tiempo de acceso
-                self.access_times[doc_hash] = datetime.now()
-                logger.debug(f"✅ Documento encontrado en caché de contexto: {doc_hash[:8]}...")
-                return self.context_cache[doc_hash]
-            
-            return None
-            
-        except Exception as e:
-            logger.error(f"❌ Error recuperando documento de caché: {str(e)}")
-            return None
-    
-    def search_in_cache(self, query, similarity_threshold=0.3):  # Reducir threshold
+    def search_in_cache(self, query, top_k=3, similarity_threshold=0.6):
         """
-        Busca documentos en la caché que puedan responder la consulta
+        Busca documentos en la caché usando búsqueda semántica
+        Returns:
+            list: Documentos relevantes ordenados por similitud
         """
         try:
-            results = []
-            query_lower = query.lower()
-            query_words = query_lower.split()
+            if not query or len(query.strip()) < 3:
+                return []
             
-            for doc_hash, doc_data in self.context_cache.items():
-                content = doc_data["content"].lower()
+            # Generar embedding de la consulta
+            query_embedding = self.embedding_model.encode(query).tolist()
+            
+            # Buscar en ChromaDB
+            results = self.collection.query(
+                query_embeddings=[query_embedding],
+                n_results=top_k,
+                include=["documents", "metadatas", "distances"]
+            )
+            
+            # Filtrar por threshold de similitud
+            relevant_results = []
+            for i, (doc, metadata, distance) in enumerate(zip(
+                results["documents"][0], 
+                results["metadatas"][0], 
+                results["distances"][0]
+            )):
+                similarity = 1 - distance  # Convertir distancia a similitud
                 
-                # Búsqueda más flexible: contar coincidencias de palabras
-                word_matches = sum(1 for word in query_words if word in content)
-                similarity_score = word_matches / len(query_words) if query_words else 0
-                
-                # También verificar coincidencia parcial con el documento completo
-                if similarity_score >= similarity_threshold or any(word in content for word in ["python", "programación", "lenguaje"]):
-                    results.append({
-                        "document": doc_data["content"],
-                        "metadata": doc_data["metadata"],
-                        "similarity": similarity_score
+                if similarity >= similarity_threshold:
+                    relevant_results.append({
+                        "document": doc,
+                        "metadata": metadata,
+                        "similarity": round(similarity, 3),
+                        "rank": i + 1
                     })
             
-            logger.debug(f"✅ Búsqueda en caché de contexto: {len(results)} resultados")
-            return results
+            logger.debug(f"✅ Búsqueda semántica: {len(relevant_results)} resultados relevantes")
+            return relevant_results
             
         except Exception as e:
-            logger.error(f"❌ Error buscando en caché de contexto: {str(e)}")
+            logger.error(f"❌ Error en búsqueda semántica: {str(e)}")
             return []
     
-    def clear_old_entries(self, max_age_hours=24):
-        """Limpia entradas antiguas de la caché"""
+    def get_context_stats(self):
+        """Obtiene estadísticas de la caché de contexto"""
         try:
-            cutoff_time = datetime.now() - timedelta(hours=max_age_hours)
-            old_entries = [
-                doc_hash for doc_hash, access_time in self.access_times.items()
-                if access_time < cutoff_time
-            ]
-            
-            for doc_hash in old_entries:
-                self.context_cache.pop(doc_hash, None)
-                self.access_times.pop(doc_hash, None)
-            
-            logger.info(f"🔄 Limpiadas {len(old_entries)} entradas antiguas de caché")
+            stats = self.collection.count()
+            return {
+                "total_documents": stats,
+                "status": "active"
+            }
+        except Exception as e:
+            logger.error(f"❌ Error obteniendo estadísticas: {str(e)}")
+            return {"total_documents": 0, "status": "error"}
+    
+    def clear_old_entries(self, max_age_days=30):
+        """Limpia entradas antiguas de la caché (implementación básica)"""
+        try:
+            count = self.collection.count()
+            logger.info(f"🔄 Caché contiene {count} documentos (limpieza manual requerida)")
+            return count
             
         except Exception as e:
-            logger.error(f"❌ Error limpiando caché: {str(e)}")
+            logger.error(f"❌ Error en limpieza de caché: {str(e)}")
+            return 0
+    
+    def get_document_by_hash(self, doc_hash):
+        """Recupera un documento específico por su hash"""
+        try:
+            results = self.collection.get(ids=[doc_hash])
+            if results["documents"]:
+                return {
+                    "document": results["documents"][0],
+                    "metadata": results["metadatas"][0]
+                }
+            return None
+        except Exception as e:
+            logger.error(f"❌ Error recuperando documento: {str(e)}")
+            return None
 
 # Instancia singleton para ser importada
 context_cache = ContextCache()

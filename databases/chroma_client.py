@@ -1,54 +1,64 @@
-# databases/chroma_client.py
 import logging
 import chromadb
 from chromadb.config import Settings
-from config.settings import CHROMA_HOST, CHROMA_PORT, CHROMA_COLLECTION_NAME
-from models.embeddings import embedding_model
+import os
 
 logger = logging.getLogger(__name__)
 
 class ChromaClient:
-    """Cliente para interactuar con ChromaDB"""
+    """Cliente para interactuar con ChromaDB local"""
     
-    def __init__(self):
+    def __init__(self, persist_directory: str = "./chroma_db"):
         try:
-            # Configurar cliente de Chroma
-            self.client = chromadb.HttpClient(
-                host=CHROMA_HOST,
-                port=CHROMA_PORT,
-                settings=Settings(allow_reset=True)
+            # Configurar cliente de Chroma local con persistencia
+            self.client = chromadb.PersistentClient(
+                path=persist_directory,
+                settings=Settings(
+                    allow_reset=True,
+                    anonymized_telemetry=False 
+                )
             )
             
             # Crear o obtener la colección
             self.collection = self.client.get_or_create_collection(
-                name=CHROMA_COLLECTION_NAME,
-                metadata={"hnsw:space": "cosine"}
+                name="legal_documents",
+                metadata={
+                    "hnsw:space": "cosine",
+                    "description": "Colección de documentos legales y laborales"
+                }
             )
             
-            logger.info(f"✅ Cliente ChromaDB conectado a {CHROMA_HOST}:{CHROMA_PORT}")
-            logger.info(f"✅ Colección '{CHROMA_COLLECTION_NAME}' lista")
+            logger.info(f"✅ Cliente ChromaDB local inicializado en: {persist_directory}")
+            logger.info(f"✅ Colección 'legal_documents' lista (documentos: {self.collection.count()})")
             
         except Exception as e:
-            logger.error(f"❌ Error conectando con ChromaDB: {str(e)}")
-            raise
+            logger.error(f"❌ Error inicializando ChromaDB: {str(e)}")
+            # Fallback a cliente en memoria
+            try:
+                self.client = chromadb.Client()
+                self.collection = self.client.get_or_create_collection(
+                    name="legal_documents",
+                    metadata={"hnsw:space": "cosine"}
+                )
+                logger.warning("🔄 Usando ChromaDB en memoria por error de persistencia")
+            except Exception as fallback_error:
+                logger.critical(f"💥 Error crítico con ChromaDB: {fallback_error}")
+                raise
     
     def add_documents(self, documents, ids=None, metadatas=None):
-        """Añade documentos a la colección con sus embeddings"""
+        """Añade documentos a la colección (ahora usa embeddings de Chroma por defecto)"""
         if not documents:
+            logger.warning("⚠️ Intento de añadir documentos vacíos")
             return
         
         try:
-            # Generar embeddings
-            embeddings = embedding_model.get_embeddings(documents)
-            
             # Si no se proporcionan IDs, generar automáticamente
             if ids is None:
-                ids = [f"doc_{i}" for i in range(len(documents))]
+                ids = [f"doc_{i}_{hash(doc[:50])}" for i, doc in enumerate(documents)]
             
             # Añadir a la colección
             self.collection.add(
                 documents=documents,
-                embeddings=embeddings,
                 ids=ids,
                 metadatas=metadatas
             )
@@ -59,38 +69,88 @@ class ChromaClient:
             logger.error(f"❌ Error añadiendo documentos: {str(e)}")
             raise
     
-    def search(self, query_text, n_results=5):
-        """Busca documentos similares a la consulta"""
+    def search(self, query_text, n_results=5, where_filter=None):
+        """Busca documentos similares a la consulta usando embeddings de Chroma"""
         try:
-            # Generar embedding de la consulta
-            query_embedding = embedding_model.get_embeddings(query_text)[0]
-            
-            # Realizar búsqueda
+            # Realizar búsqueda semántica 
             results = self.collection.query(
-                query_embeddings=[query_embedding],
-                n_results=n_results
+                query_texts=[query_text],
+                n_results=n_results,
+                where=where_filter,
+                include=["documents", "metadatas", "distances"]
             )
             
+            logger.debug(f"✅ Búsqueda completada: {len(results['documents'][0])} resultados")
             return results
             
         except Exception as e:
-            logger.error(f"❌ Error en búsqueda: {str(e)}")
-            return {'documents': [[]], 'ids': [[]]}
+            logger.error(f"❌ Error en búsqueda semántica: {str(e)}")
+            return {'documents': [[]], 'metadatas': [[]], 'distances': [[]], 'ids': [[]]}
+    
+    def search_by_embedding(self, query_embedding, n_results=5, where_filter=None):
+        """Búsqueda usando embedding precalculado (para integración avanzada)"""
+        try:
+            results = self.collection.query(
+                query_embeddings=[query_embedding],
+                n_results=n_results,
+                where=where_filter,
+                include=["documents", "metadatas", "distances"]
+            )
+            return results
+        except Exception as e:
+            logger.error(f"❌ Error en búsqueda por embedding: {str(e)}")
+            return {'documents': [[]], 'metadatas': [[]], 'distances': [[]], 'ids': [[]]}
+    
+    def get_collection_stats(self):
+        """Obtiene estadísticas de la colección"""
+        try:
+            count = self.collection.count()
+            return {
+                "total_documents": count,
+                "collection_name": self.collection.name,
+                "status": "active"
+            }
+        except Exception as e:
+            logger.error(f"❌ Error obteniendo estadísticas: {str(e)}")
+            return {"total_documents": 0, "status": "error"}
     
     def reset_collection(self):
         """Elimina todos los documentos de la colección (para desarrollo)"""
         try:
-            # Método alternativo: obtener todos los IDs y eliminarlos
-            existing_docs = self.collection.get()
-            if existing_docs['ids']:
-                self.collection.delete(ids=existing_docs['ids'])
-                logger.warning(f"🔄 Colección limpiada: {len(existing_docs['ids'])} documentos eliminados")
-            else:
-                logger.info("ℹ️ La colección ya está vacía")
-                
+            count_before = self.collection.count()
+            self.client.delete_collection(name="legal_documents")
+            self.collection = self.client.get_or_create_collection(
+                name="legal_documents",
+                metadata={"hnsw:space": "cosine"}
+            )
+            logger.warning(f"🔄 Colección resetada: {count_before} documentos eliminados")
+            return count_before
         except Exception as e:
             logger.error(f"❌ Error reseteando colección: {str(e)}")
-            raise
+            try:
+
+                existing_docs = self.collection.get()
+                if existing_docs['ids']:
+                    self.collection.delete(ids=existing_docs['ids'])
+                    logger.warning(f"🔄 Colección limpiada: {len(existing_docs['ids'])} documentos eliminados")
+                    return len(existing_docs['ids'])
+            except Exception as fallback_error:
+                logger.error(f"❌ Error en método alternativo de reset: {fallback_error}")
+                raise
+    
+    def get_document(self, document_id):
+        """Obtiene un documento específico por ID"""
+        try:
+            results = self.collection.get(ids=[document_id])
+            if results['documents']:
+                return {
+                    'document': results['documents'][0],
+                    'metadata': results['metadatas'][0] if results['metadatas'] else {}
+                }
+            return None
+        except Exception as e:
+            logger.error(f"❌ Error obteniendo documento {document_id}: {str(e)}")
+            return None
 
 # Instancia singleton para ser importada
 chroma_client = ChromaClient()
