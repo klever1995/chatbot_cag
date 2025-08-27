@@ -1,138 +1,102 @@
+# core/cag_engine.py
 import logging
 from models.llms import azure_llm_client
-from cache.context_cache import context_cache
 from cache.redis_manager import redis_cache
 
 logger = logging.getLogger(__name__)
 
 class CAGEngine:
-    """Motor CAG para respuestas eficientes desde caché de contexto y conversación general"""
-    
+    """Motor CAG para respuestas con contexto externo"""
+
     def __init__(self):
         logger.info("✅ Motor CAG inicializado")
-    
-    def generate_response(self, query, is_general_conversation=False):
-        """Genera una respuesta usando el contexto cacheado o conversación general"""
+
+    def generate_response(self, query, external_context=None):
+        """
+        Genera una respuesta usando contexto externo desde RAG.
+        
+        Parámetros:
+            query (str): Pregunta del usuario.
+            external_context (str, opcional): Contexto completo pasado desde RAG.
+        """
         try:
-            # Conversación general (sin caché de documentos)
-            if is_general_conversation:
-                logger.debug(f"💬 Modo conversación general: {query}")
-                return self._generate_general_response(query)
-            
-            #Búsqueda en caché de contexto documental
-            logger.debug(f"🔍 Buscando en caché de contexto: {query}")
-            context_results = context_cache.search_in_cache(query)
-            
-            if not context_results:
-                return "No tengo información suficiente en mi conocimiento almacenado para responder esta pregunta."
-            
-            # Construir contexto con los documentos encontrados
-            context = self._build_context(context_results)
-            
-            # Generar prompt para el LLM con contexto documental
-            messages = self._build_document_context_messages(query, context)
-            
-            # Obtener respuesta del LLM optimizada para contexto legal
-            logger.debug("Generando respuesta legal con Azure OpenAI...")
-            response = azure_llm_client.generate_legal_response(messages)
-            
-            # Cachear respuesta en Redis
-            redis_cache.set_cached_response(query, response)
-            
-            logger.debug("✅ Respuesta CAG generada exitosamente")
+            # 1. Verificar si existe respuesta en Redis
+            cached_response = redis_cache.get_cached_response(query)
+            if cached_response:
+                logger.debug(f"✅ Respuesta recuperada de Redis: {query}")
+                return cached_response
+
+            # 2. Validar que tenemos contexto externo
+            if not external_context:
+                logger.debug("❌ No se proporcionó contexto externo")
+                return "No tengo información suficiente para responder esta pregunta."
+
+            # 3. Generar prompt para el LLM
+            messages = self._build_messages(query, external_context)
+
+            # 4. Obtener respuesta del LLM
+            logger.debug("🔄 Generando respuesta con Azure OpenAI...")
+            response = azure_llm_client.generate_response(messages)
+
+            # 5. Cachear respuesta en Redis SOLO si es una respuesta válida
+            if response and not self._is_negative_response(response):
+                redis_cache.set_cached_response(query, response)
+                logger.debug("✅ Respuesta válida cacheada en Redis")
+            else:
+                logger.debug("⏩ Respuesta negativa NO cacheada en Redis")
+
+            logger.info("✅ Respuesta CAG generada exitosamente")
             return response
-            
+
         except Exception as e:
             logger.error(f"❌ Error en el motor CAG: {str(e)}")
             return "Lo siento, ocurrió un error al procesar tu consulta."
-    
-    def _generate_general_response(self, query):
-        """Genera respuestas para conversación general"""
-        general_messages = [
-            {
-                "role": "system", 
-                "content": """Eres un asistente amable y útil especializado en temas laborales y legales. 
-Responde preguntas generales de manera cortés pero mantén el foco en tu área de expertise.
-Para preguntas muy personales o fuera de contexto, redirige amablemente a temas laborales.
-Mantén respuestas breves y naturales."""
-            },
-            {
-                "role": "user", 
-                "content": query
-            }
+
+    def _is_negative_response(self, response):
+        """Determina si la respuesta es negativa (no debe cachearse)"""
+        if not response or not response.strip():
+            return True
+            
+        negative_phrases = [
+            "no lo sé",
+            "no tengo información",
+            "no está en el contexto",
+            "no encuentro",
+            "no se menciona",
+            "no aparece",
+            "no puedo responder"
         ]
-        
-        try:
-            # Método optimizado para conversación
-            response = azure_llm_client.generate_conversational_response(general_messages)
-            redis_cache.set_cached_response(query, response)
-            return response
-        except Exception as e:
-            logger.error(f"❌ Error en respuesta general: {str(e)}")
-            return "¡Hola! Soy un asistente especializado en temas laborales y documentación. ¿En qué puedo ayudarte hoy?"
-    
-    def _build_context(self, context_results):
-        """Construye el contexto a partir de los resultados de caché"""
-        if not context_results:
-            return "No se encontró contexto relevante."
-        
-        context = "📚 CONTEXTO ENCONTRADO EN KNOWLEDGE BASE:\n\n"
-        
-        for i, result in enumerate(context_results, 1):
-            similarity = result.get('similarity', 0)
-            context += f"--- Documento {i} (Relevancia: {similarity:.0%}) ---\n"
-            context += f"{result['document']}\n\n"
-        
-        return context
-    
-    def _build_document_context_messages(self, query, context):
-        """Construye los mensajes para el LLM con el contexto cacheado"""
-        system_message = """Eres un asistente legal/laboral especializado. Responde preguntas basándote ÚNICAMENTE en el contexto proporcionado.
+        response_lower = response.lower()
+        return any(phrase in response_lower for phrase in negative_phrases)
 
-REGLAS ESTRICTAS:
-1. Responde EXCLUSIVAMENTE con información del contexto proporcionado
-2. Si la información no está en el contexto, di: "No tengo información sobre esto en mi knowledge base"
-3. Sé preciso, conciso y profesional
-4. Usa el mismo idioma de la pregunta
-5. Cita la relevancia del documento cuando sea apropiado
-6. Mantén un tono profesional pero accesible
+    def _build_messages(self, query, context):
+        """Construye los mensajes para el LLM con el contexto"""
+        system_message = """Eres un asistente útil que responde preguntas basándose ÚNICAMENTE 
+en el contexto proporcionado. 
+Sigue estas reglas:
+1. Responde solo con la información del contexto
+2. Si la información no está en el contexto, di "No lo sé"
+3. Sé conciso y directo
+4. Usa el mismo idioma de la pregunta"""
 
-IMPORTANTE: Nunca inventes información o hagas suposiciones fuera del contexto."""
+        # Limitar el tamaño del contexto para no exceder tokens
+        limited_context = context[:12000]  # ~3000 tokens aprox
 
-        user_message = f"""CONTEXTO DE KNOWLEDGE BASE:
-{context}
+        user_message = f"""Contexto:
+{limited_context}
 
-PREGUNTA: {query}
+Pregunta: {query}
 
-INSTRUCCIÓN: Responde la pregunta basándote ÚNICAMENTE en el contexto anterior. Si la respuesta no está en el contexto, indícalo claramente."""
+Por favor, responde basándote solo en el contexto anterior. Si la información no está en el contexto, di "No lo sé"."""
 
         return [
             {"role": "system", "content": system_message},
             {"role": "user", "content": user_message}
         ]
-    
-    def _handle_empty_context(self, query):
-        """Maneja el caso cuando no se encuentra contexto relevante"""
-        no_context_messages = [
-            {
-                "role": "system",
-                "content": """Eres un asistente especializado en temas laborales. 
-Cuando no tienes información en tu knowledge base, responde amablemente indicando esto y ofrece ayuda dentro de tu área de expertise."""
-            },
-            {
-                "role": "user",
-                "content": f"Pregunta: {query}\n\nInstrucción: Responde indicando que no tienes información específica sobre esto en tu knowledge base, pero mantén un tono útil."
-            }
-        ]
-        
-        try:
-            return azure_llm_client.generate_conversational_response(no_context_messages)
-        except Exception:
-            return "No tengo información específica sobre esto en mi knowledge base. ¿Puedo ayudarte con alguna otra consulta laboral?"
 
-    def process_query(self, query, is_general_conversation=False):
+    def process_query(self, query, external_context=None):
         """Método principal para procesar consultas CAG"""
-        return self.generate_response(query, is_general_conversation)
+        return self.generate_response(query, external_context=external_context)
 
 # Instancia singleton para ser importada
 cag_engine = CAGEngine()

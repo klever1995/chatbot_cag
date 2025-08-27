@@ -1,3 +1,4 @@
+# evaluation/langfuse_monitoring.py
 import logging
 from typing import Optional
 
@@ -14,7 +15,7 @@ class LangfuseMonitor:
         Simula el tracing de una consulta sin enviar datos a Langfuse
         """
         try:
-            # Loguear localmente para debugging
+            # Solo loguear localmente para debugging
             logger.debug(f"📊 Tracing dummy - Query: '{query}', Ruta: {route}, User: {user_id}")
             logger.debug(f"📊 Response: {response[:100]}...")
             

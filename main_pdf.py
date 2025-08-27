@@ -4,20 +4,15 @@
 import os
 import warnings
 
-# Desactivar advertencias SSL
 warnings.filterwarnings("ignore", message="Unverified HTTPS request")
-
-# Desactivar completamente la verificación SSL
 os.environ['SSL_CERT_FILE'] = ""
 os.environ['REQUESTS_CA_BUNDLE'] = ""
 os.environ['CURL_CA_BUNDLE'] = ""
 os.environ['PYTHONHTTPSVERIFY'] = "0"
-
-# Configurar para deshabilitar verificación SSL en todas las librerías
 os.environ['NO_PROXY'] = '*'
 
 # ============================
-# IMPORTACIONES (después de configurar SSL)
+# IMPORTACIONES
 # ============================
 import logging
 import ssl
@@ -28,16 +23,13 @@ from pydantic import BaseModel
 from pathlib import Path
 from PyPDF2 import PdfReader
 
-# Desactivar verificación SSL a nivel global
 ssl._create_default_https_context = ssl._create_unverified_context
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-
-# Configurar sesión global de requests sin verificación SSL
 requests_session = requests.Session()
 requests_session.verify = False
 
 # ============================
-# IMPORTACIONES DE MÓDULOS PROPIOS (después de configurar SSL)
+# MÓDULOS PROPIOS
 # ============================
 from core.orchestrator import orchestrator
 from core.rag_engine import rag_engine
@@ -45,18 +37,18 @@ from core.cag_engine import cag_engine
 from evaluation.langfuse_monitoring import langfuse_monitor
 
 # ============================
-# CONFIGURAR LOGGING
+# LOGGING
 # ============================
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # ============================
-# INICIALIZAR FASTAPI
+# FASTAPI
 # ============================
 app = FastAPI(title="Sistema RAG + CAG", version="1.0.0")
 
 # ============================
-# MODELOS Pydantic
+# MODELOS
 # ============================
 class QueryRequest(BaseModel):
     query: str
@@ -77,45 +69,54 @@ async def upload_pdf(file: UploadFile = File(...)):
         file_path = Path("uploaded_docs") / file.filename
         file_path.parent.mkdir(exist_ok=True)
 
-        # Guardar archivo temporal
         with open(file_path, "wb") as f:
             f.write(await file.read())
 
-        # Leer texto del PDF
         reader = PdfReader(str(file_path))
         full_text = ""
         for page in reader.pages:
             full_text += page.extract_text() + "\n"
 
-        # Indexar en RAG con jerarquía
         doc_id = file.filename.replace(".", "_")
         rag_engine.ingest_document(doc_id, full_text)
 
         return {"status": "success", "message": f"Documento {file.filename} indexado correctamente."}
-
     except Exception as e:
-        logger.error(f"❌ Error subiendo PDF: {e}", exc_info=True)
+        logger.error(f" Error subiendo PDF: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
+
 
 @app.post("/query", response_model=QueryResponse)
 async def process_query(request: QueryRequest):
-    """Endpoint principal para procesar consultas"""
+    """Procesa consultas con fallback RAG → CAG"""
     try:
-        logger.info(f"📥 Consulta recibida: '{request.query}'")
+        logger.info(f" Consulta recibida: '{request.query}'")
 
-        # 1. Decidir la ruta (RAG vs CAG) y si es conversación general
-        route, is_general = orchestrator.route_query(request.query)
-        logger.info(f"🔄 Ruta decidida: {route.upper()} (general: {is_general})")
+        # 1. Decidir la ruta (string garantizado)
+        route = orchestrator.route_query(request.query)
+        if isinstance(route, dict):
+            route = route.get("route", "rag")  # fallback por si devuelve dict
+        logger.info(f" Ruta inicial decidida: {route.upper()}")
 
         # 2. Procesar según la ruta
+        response = None
+        source = ""
+
         if route == "rag":
             response = rag_engine.generate_answer(request.query)
             source = "chroma_db"
+
+            # Fallback a CAG si RAG no devuelve respuesta significativa
+            if not response or "No lo sé" in response or "no encuentro" in response.lower():
+                logger.info(" RAG no encontró respuesta → fallback a CAG")
+                response = cag_engine.process_query(request.query)
+                source = "context_cache"
+                route = "cag"
         else:
-            response = cag_engine.process_query(request.query, is_general_conversation=is_general)
+            response = cag_engine.process_query(request.query)
             source = "context_cache"
 
-        # 3. Monitorear con Langfuse (opcional)
+        # 3. Monitoreo Langfuse opcional
         try:
             langfuse_monitor.trace_query(
                 query=request.query,
@@ -124,9 +125,9 @@ async def process_query(request: QueryRequest):
                 user_id=request.user_id
             )
         except Exception as e:
-            logger.warning(f"⚠️ Error en monitoreo Langfuse: {e}")
+            logger.warning(f" Error en monitoreo Langfuse: {e}")
 
-        logger.info(f"📤 Respuesta generada via {route.upper()}")
+        logger.info(f" Respuesta generada vía {source}")
 
         return QueryResponse(
             response=response,
@@ -135,17 +136,16 @@ async def process_query(request: QueryRequest):
         )
 
     except Exception as e:
-        logger.error(f"❌ Error procesando consulta: {e}")
+        logger.error(f" Error procesando consulta: {e}")
         raise HTTPException(status_code=500, detail="Error interno del servidor")
+
 
 @app.get("/health")
 async def health_check():
-    """Endpoint de health check"""
     return {"status": "healthy", "service": "rag-cag-system"}
 
 @app.get("/")
 async def root():
-    """Endpoint raíz"""
     return {
         "message": "Sistema RAG + CAG funcionando",
         "endpoints": {
