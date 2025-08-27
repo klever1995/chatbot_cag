@@ -19,6 +19,7 @@ import ssl
 import urllib3
 import requests
 from fastapi import FastAPI, HTTPException, File, UploadFile
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from pathlib import Path
 from PyPDF2 import PdfReader
@@ -46,6 +47,17 @@ logger = logging.getLogger(__name__)
 # FASTAPI
 # ============================
 app = FastAPI(title="Sistema RAG + CAG", version="1.0.0")
+
+# ============================
+# CONFIGURACIÓN CORS
+# ============================
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:3000", "http://localhost:3001"],  # URLs de tu frontend
+    allow_credentials=True,
+    allow_methods=["*"],  # Permite todos los métodos (GET, POST, etc.)
+    allow_headers=["*"],  # Permite todos los headers
+)
 
 # ============================
 # MODELOS
